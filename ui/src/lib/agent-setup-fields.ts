@@ -48,6 +48,8 @@ export const SETUP_LOGIN_HINTS: Record<string, string> = {
     "Use a Cursor API key, or run agent login on the selected environment's host.",
   gemini_local:
     "Use a Gemini API key, or an existing supported Gemini CLI login on the selected environment's host.",
+  antigravity_local:
+    "Antigravity uses a Google account sign-in. Run agy on the selected environment's host with the same HOME as this agent, sign in, then test the connection here.",
   kimi_local:
     "Use a Kimi API key and model settings below, or run kimi login on the selected environment's host.",
   grok_local:

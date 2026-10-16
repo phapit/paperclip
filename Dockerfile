@@ -35,6 +35,7 @@ COPY packages/adapters/cursor-cloud/package.json packages/adapters/cursor-cloud/
 COPY packages/adapters/cursor-local/package.json packages/adapters/cursor-local/
 COPY packages/adapters/gemini-local/package.json packages/adapters/gemini-local/
 COPY packages/adapters/grok-local/package.json packages/adapters/grok-local/
+COPY packages/adapters/antigravity-local/package.json packages/adapters/antigravity-local/
 COPY packages/adapters/kimi-local/package.json packages/adapters/kimi-local/
 COPY packages/adapters/hermes/package.json packages/adapters/hermes/
 COPY packages/adapters/hermes-gateway/package.json packages/adapters/hermes-gateway/
@@ -180,6 +181,12 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
+
+# Antigravity CLI (agy), official installer (checksum-verified by the script).
+# System-wide install; signing in happens at runtime under a per-account HOME.
+RUN echo "agy-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
+  && bash -c 'set -o pipefail; curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin' \
+  && agy --version
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
