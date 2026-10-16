@@ -1355,6 +1355,8 @@ The current app also exposes V1-supporting surfaces for:
   derive `deliveryState` as `merged_via_pr | merged_by_ancestry | unmerged | unknown`; terminal issue trees with a
   merged delivery and no active checkout run become cleanup-eligible with reason `issue_terminal` and are archived
   through the workspace cleanup path. Reopening the source issue records activity but does not restore that workspace.
+  Before that, terminal isolated worktrees are compacted: ignored, untracked dependency, build, and cache directories
+  are removed while the workspace, its branch, and all source changes stay, and reuse regenerates them.
 - task watchdog configuration and reusable watchdog issue orchestration for explicitly watched issue subtrees
 - routines and scheduled/API/webhook triggers
 - plugin installation, configuration, state, jobs, logs, webhooks, and plugin database namespace migration
@@ -2082,6 +2084,12 @@ unavailable. Preserve current ownership and newer-work fences. See
   and history. New key collisions cannot overwrite unrelated skills. Only changed package
   bytes or executable modes create versions. Library reads, tests, and subsequent unpinned
   runs use local installed snapshots; pinned/active runs retain their versions.
+- Runtime version directories are disposable caches. An hourly, bounded sweep may
+  evict non-current copies unused for one hour, preserving active and unresolved
+  execution pins. Selection, materialization, and pin persistence serialize with
+  eviction across processes. Missing copies rebuild from immutable database bytes
+  without upstream access. See [recoverable disk cleanup](recoverable-disk-cleanup.md)
+  for rollout controls, legacy grace periods, and interrupted cleanup recovery.
 - Manually selected sources retain reviewed selection, with new candidates checked by default and
   explicit folder exclusions retained. Upstream deletion keeps installed content with
   removed status; moves are removal plus discovery. Deselect retains content
@@ -2108,11 +2116,15 @@ unavailable. Preserve current ownership and newer-work fences. See
   be paused independently of selection. Project sources select future additions unless
   excluded; existing manually imported sources retain their selections. Legacy projects
   adopt through an explicit company-scoped, project-authorized endpoint, never a GET.
-- Repository size fallback must not discard installed shared dependencies or
-  publish packages with detected omitted dependencies. Retain affected versions
-  and report the size problem. Self-contained packages can still update through
-  fallback. Project sources retry complete repository packaging and return to it
-  when supported; selections and exclusions remain unchanged.
+- Repository size fallback first retains skill folders and transitively referenced
+  repository files within the existing file/byte limits, preserving original paths.
+  If that set is still too large, bounded skill folders remain importable. Missing
+  references are advisory and do not invalidate otherwise valid selected skills.
+  Web routes and inline Markdown examples are not package dependencies. Preserve
+  installed versions if fallback would omit their previously installed shared files.
+  Project sources retry complete packaging; selections and exclusions remain unchanged.
+  Refresh reinspects cached dependency-rejection errors once even at an unchanged
+  upstream commit. Content validation and company/project access remain enforced.
 - Unattended refresh stores setup identity and connection/grant identifiers, never token
   values. Current membership, connection authorization and skill policy are revalidated.
   Unrecoverable legacy setup identities require explicit connection repair. Retries are

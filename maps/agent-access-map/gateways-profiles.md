@@ -58,6 +58,11 @@ own policy and access review.
 
 Gaps: Agent access to tools does not permit profile editing.
 
+Backend evidence: [profile entry validation](../../server/src/__tests__/tool-profile-entry-validation.test.ts)
+covers company-scoped selector references and bounded reads for a large immutable
+runtime assignment. Batched validation retains the checks before profile and
+entry writes. It grants no profile-management authority to agents.
+
 ## `client-connect`
 
 Review: `baseline`.
@@ -83,6 +88,14 @@ remaining operations before qualifying the whole capability.
 
 Gaps: Scoped sessions remain agent/run-bound. MCP requires its existing protocol
 client; named gateways and gateway-token management retain board permissions.
+
+Discovery collapses identical descriptors with the same gateway name across
+providers, including native assigned-tool startup and fresh searches. Conflicting
+definitions remain an error. Distinct names and the normal invocation grants,
+approvals and revocation checks remain independent. Regression coverage lives in
+[gateway tests](../../server/src/__tests__/tool-gateway.test.ts) and
+[assigned-tool tests](../../server/src/services/native-runtime/assigned-mcp-tools.test.ts);
+these fixtures do not certify a live external-client journey.
 
 ## `tokens`
 

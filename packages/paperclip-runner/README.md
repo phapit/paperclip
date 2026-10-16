@@ -14,6 +14,31 @@ session and issue-thread surfaces, a public browser/React SDK, a standalone
 adapter demo, and a deterministic mock control plane. None of these surfaces
 imports or starts Paperclip's server, UI, CLI, or production database.
 
+## Execution environment lifecycle
+
+`RunnerExecutionDriver` defines the environment hooks shared by coding harnesses
+and external bot harnesses. The server's `createNativeRunnerExecutionDriver`
+supplies this contract for local, SSH, and sandbox execution. Provider-specific
+session setup stays separate from environment selection.
+
+Connection registration prepares remote resources and returns the process's
+connection configuration before launch. Local Runners connect to Core over
+loopback WS. SSH Runners and eligible sandboxes connect to the configured Core
+WSS endpoint. Sandboxes with authorized WebSocket ingress listen inside the
+sandbox; Core connects through the provider endpoint after process dispatch.
+Ingress selection fails closed and does not fall back to outbound WSS.
+
+The returned activation, readiness, failure, checkpoint, and release hooks feed
+the existing shared PRP control plane. PRP owns authentication, commands, replay,
+tool authority, and run transitions. Process ownership hooks provide launch,
+verified adoption, and durable state access. A lost connection does not prove
+process termination, and a required checkpoint failure must prevent lease release.
+
+The driver is an in-process interface. Its filesystem paths and process launch
+specifications are internal to built-in execution; they are not a plugin wire
+contract. Existing flat transport options remain compatible through this shared
+interface. This refactor does not add Launcher APIs or change harness capabilities.
+
 Connection continuations inspect the harness descriptor's optional
 `toolRefreshOnResume` capability. Native Codex, Claude Managed Agents, AgentCore,
 OpenCode, and qualified Claude/Codex/Grok ACPX profiles expose it; unqualified
@@ -231,7 +256,10 @@ scripts; it verifies native startup and package continuity separately from the
 restricted Docker installation check. This does not prove a normal OS package
 installation journey or a paid provider task on ARM64.
 
-Windows, 32-bit ARM, and Alpine/musl native qualification remain deferred.
+Automatic creation selects legacy execution when a Linux host has musl, unknown
+libc, or a measured GNU libc version below the baseline. Existing agents retain
+their stored runner. Windows, 32-bit ARM, and Alpine/musl native qualification
+remain deferred.
 
 Native release jobs cache Cargo dependencies per platform and OS baseline,
 including compiler, lockfile, and external generated-contract inputs. Workspace
@@ -704,3 +732,56 @@ canonical event retained for that command. The header marker `🖇️ v0.1.2`
 identifies the current console iteration.
 
 `create_task` accepts an optional initial `status` of `backlog` or `todo`. Use `backlog` when the user wants a saved task or plan without execution: assignment and the initial plan are committed without scheduling a wake, even when dependencies are already complete. Omitting status preserves immediate delegation (`todo`, or `blocked` for unresolved dependencies).
+
+### Oversized OpenCode events
+
+The OpenCode driver keeps SSE frames up to 1,048,576 characters exact. It compacts longer
+frames while retaining tool identity, status, and bounded output excerpts. This
+also applies when a complete large frame arrives inside one network chunk.
+Canonical tool rows mark shortened output, report its original byte count, and
+do not claim a digest for text that was not retained. A structure that cannot
+fit the compacted bound produces a diagnostic; the event stream continues.
+
+Tool output and error fields have reserved retention space and size records,
+so large input values cannot consume their output tails or make excerpts look
+complete. A separator split between reads does not count against the frame limit.
+## Preconfigured home
+
+Set `homeMode: "preconfigured"` in a `paperclip_runner` agent's adapter config
+(or the runnerd transport options) to use the execution account's existing home.
+The default is `"isolated"`. The initial supported providers are native Codex
+and ACPX Claude. Preconfigured ACPX Codex fails before launch until its session
+permissions can enforce denial of Runner state; use native Codex or isolated mode.
+An operator must select this mode on the agent/Runner
+configuration. Task-level overrides are rejected, and agent credentials cannot
+set or inherit this option. Other providers reject this option. The internal ACPX task bridge uses a stable
+session name so an existing user MCP server named `paperclip` remains available.
+
+Prepare authentication, skills, and external MCP servers on the execution machine
+before launching. Runner does not install skills, copy or remove credentials, or
+rewrite user configuration in this mode. Providers can still refresh credentials
+and update their own metadata. Runner still supplies the requested
+model, task instructions, and its internal task/completion tools. Local permission
+rules and hooks apply. Native Codex tools can read and modify the execution home
+(read-only for planning); credentials in that home are not isolated from tools.
+Native Codex separately denies Runner-owned protocol state; ACPX Claude retains
+its existing provider trust boundary. Execution is unattended: native Codex uses `never`, and
+ACPX rejects requests for approval. The initial ACPX mode requires the Runner
+setting `acpxPermissionMode: "approve-all"` (its default); other Runner modes are
+unqualified here and fail before launch. Local permission rules still apply.
+Preconfigured ACPX read-only/planning tasks also fail before provider launch
+until a read-only launch is qualified; use isolated mode or native Codex for planning.
+If local settings block a task, change them
+and retry. Existing blocked results and failure diagnostics report the outcome;
+a hook that also blocks the reporting tool can leave only a generic diagnostic.
+
+Runner retains private protocol/session state and a fence for each session.
+Different sessions may share the same home. Mode and home bindings fence recovery;
+switching either requires a new session. Backups never include the external home.
+Recovering a run uses its saved mode even if the agent configuration has changed.
+Remote execution discovers the execution account's home on the remote machine
+using `getent`; it does not copy the controller's HOME, XDG paths, or login state.
+The external provider history must still exist to resume a session after a remote
+machine is replaced. Missing history fails recovery rather than importing an
+isolated home. OpenCode and the remaining ACPX profiles require separate
+qualification before this mode can be enabled for them.

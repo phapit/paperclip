@@ -1,4 +1,5 @@
 import { idleWorkSnapshot } from "../services/task-admission.js";
+import { stageReceiptReactionRemovals } from "../services/chat-receipt-reactions.js";
 import type { Db } from "@paperclipai/db";
 import * as activityLogModule from "../services/activity-log.js";
 import * as connectionCredentialBindings from "../services/connection-credential-bindings.js";
@@ -15,7 +16,7 @@ import { fastResponseService } from "../services/fast-responses.js";
 import { fastResponseReceipt } from "../services/fast-response-provider.js";
 import { fastResponseRequests } from "@paperclipai/db";
 import { toolAccessService } from "../services/tool-access.js";
-import { toolActionRequests, toolInvocations } from "@paperclipai/db";
+import { toolActionRequests, toolInvocations, toolPolicies } from "@paperclipai/db";
 import { GitHubPublicationLeaseLost, withGitHubPublicationLease } from "../services/chat-github-publication-lease.js";
 import { secretService } from "../services/secrets.js";
 import { githubChatWizardService } from "../services/chat-github-wizard.js";
@@ -1758,6 +1759,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         | "questionFormOpenAuthorizationBarrier"
         | "questionResolutionPersistBarrier"
         | "reactionReplayEndpointLockBarrier"
+        | "receiptReactionTransportBarrier"
         | "reachAuthorizationBarrier"
         | "resolveNativeQuestion"
         | "renewCredentialMutationLease"
@@ -2536,8 +2538,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(f.wakeup).toHaveBeenCalledTimes(wakeCount);
       expect(await readIssueCommentsByIssueId(f.conversation.issueId!)).toHaveLength(1);
     });
-    async function toolReplyFixture(threadId = "github:paperclipai/paperclip:issue:418") {
+    async function toolReplyFixture(threadId = "github:paperclipai/paperclip:issue:418", reportOnly = false) {
       const f = await reviewBotFixture();
+      if (reportOnly) {
+        const config = await f.management.configuration(f.endpoint.id, "owner-user");
+        await f.management.saveConfiguration(f.endpoint.id, { expectedRevision: config.revision,
+          configuration: { ...config.configuration, defaults: { ...config.configuration.defaults, ratingThreshold: null } },
+        }, "owner-user");
+      }
       const thread = makeThread({ channelId: "paperclipai/paperclip", id: threadId }).thread;
       await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
         trigger: "mention", message: makeMessage({ id: "41801", text: "Are you there?", userId: "42", userName: "octocat", mentioned: true }) });
@@ -2549,6 +2557,302 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const session = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: conversation.issueId, runId: run.id };
       return { ...f, conversation, run, session };
     }
+    async function publicationRetryFixture() {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418", true);
+      const head = "b".repeat(40);
+      const inline: Array<{ id: number; body: string; html_url: string; user: { login: string } }> = [];
+      const checks: Array<{ id: number; external_id: string; app: { id: number }; html_url: string }> = [];
+      const writes: Array<{ path: string; method: string }> = [];
+      const provider = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/418")) return Response.json({ number: 418, state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" }, user: { id: 42, login: "octocat", type: "User" }, labels: [] });
+        if (url.includes("/files?")) return Response.json([{ filename: "src/math.ts", status: "modified", patch: "@@ -1 +1 @@\n-old\n+new" }]);
+        if (url.includes("/pulls/418/comments?")) return Response.json(inline);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: checks });
+        if (init?.method === "POST" && url.endsWith("/pulls/418/comments")) {
+          writes.push({ path: url, method: init.method });
+          const item = { id: 420 + inline.length, body: JSON.parse(String(init.body)).body,
+            html_url: "https://github.com/acme/repo/pull/418#discussion_r420", user: { login: f.endpoint.botUsername! } };
+          inline.push(item);
+          return Response.json(item);
+        }
+        if (url.includes("/check-runs") && init?.method) {
+          writes.push({ path: url, method: init.method });
+          const body = JSON.parse(String(init.body));
+          const check = checks[0] ?? { id: 419, external_id: body.external_id, app: { id: Number(f.endpoint.botExternalId) }, html_url: "https://github.com/checks/419" };
+          if (!checks.length) checks.push(check);
+          return Response.json(check);
+        }
+        return undefined;
+      };
+      f.setSupplementalProviderFetch(provider);
+      const service = githubChatReviewService(db, f.providerFetch);
+      await service.execute(f.session, "begin_review", { reviewedCommit: head });
+      const assessment = { reviewedCommit: head, score: 3, complete: true, summary: "Advisory review", rationale: "Reviewed the file",
+        coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] }, findings: [] };
+      const action = async () => (await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_review_publication"),
+      )))[0];
+      return { ...f, service, head, assessment, provider, action, inline, checks, writes };
+    }
+    it.each([false, true])("recovers an approved queued GitHub review without another approval (revoked: %s)", async revoked => {
+      const f = await publicationRetryFixture();
+      let unavailable = true;
+      let attempts = 0;
+      f.setSupplementalProviderFetch(async (input, init) => {
+        if (String(input).includes("/issues/comments/") && init?.method === "PATCH") {
+          attempts++;
+          if (unavailable) return new Response("Unavailable", { status: 503, headers: { "retry-after": "120" } });
+        }
+        return f.provider(input, init);
+      });
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => { vi.unstubAllGlobals(); });
+      await initializeRunIdentity(db, { companyId: f.companyId, runId: f.run.id, issueId: f.conversation.issueId!,
+        responsibleUserId: null, cause: "company_default" });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      const gateway = createToolGatewayService(db, { toolActionSigningSecret: "github-approval-retry-test-secret" });
+      const session = await gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: f.run.id });
+      const tool = (await githubBotToolsForSession(db, f.session)).find(tool => tool.upstreamToolName === "submit_review")!;
+      await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Review publication approval", policyType: "require_approval",
+        priority: 0, selectors: { catalogEntryId: tool.catalogEntryId! } });
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: f.assessment }))
+        .rejects.toMatchObject({ reasonCode: "approval_required" });
+      const [approval] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, f.companyId));
+      expect(await gateway.approveActionRequest({ companyId: f.companyId, actionRequestId: approval.id, actor: { userId: "owner-user" } }))
+        .toMatchObject({ status: "executed" });
+      const action = await f.action();
+      expect(action).toMatchObject({ status: "failed", result: { retryable: true } });
+      unavailable = false;
+      if (revoked) await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Revoke approved publication", policyType: "block",
+        priority: -1, selectors: { catalogEntryId: tool.catalogEntryId! } });
+      await db.update(chatActions).set({ result: { ...action.result, retryAt: new Date(0).toISOString() } }).where(eq(chatActions.id, action.id));
+      await f.service.processPending();
+      expect((await f.action()).status).toBe(revoked ? "cancelled" : "processed");
+      if (revoked) await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: f.assessment })).rejects.toThrow();
+      else expect(await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: f.assessment }))
+        .toMatchObject({ status: "replayed", result: { data: { status: "processed", score: 3 } } });
+      expect(attempts).toBe(revoked ? 1 : 2);
+      expect(await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, f.companyId))).toHaveLength(1);
+    }, 25_000);
+    it("recovers lost inline and check responses without duplicate GitHub publications", async () => {
+      const f = await publicationRetryFixture();
+      const lost = new Set<string>();
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const response = await f.provider(input, init);
+        if (init?.method === "POST" && /\/(?:comments|check-runs)$/.test(String(input)) && !lost.has(String(input))) {
+          lost.add(String(input));
+          throw new Error("Provider accepted the write but the response was lost");
+        }
+        return response;
+      });
+      const result = await f.service.execute(f.session, "submit_review", { ...f.assessment,
+        findings: [{ key: "note", path: "src/math.ts", line: 1, side: "RIGHT", severity: "error", category: "correctness", body: "Example finding" }],
+      }, "lost-receipts");
+      expect(result).toMatchObject({ status: "processed", score: 3, conclusion: "neutral" });
+      expect(f.inline).toHaveLength(1);
+      expect(f.checks).toHaveLength(1);
+      expect(f.writes.filter(write => write.method === "POST")).toHaveLength(2);
+      expect(f.responseComments.size).toBe(1);
+      expect((await f.action()).status).toBe("processed");
+    }, 25_000);
+    it("resumes a delayed GitHub publication after coordinator restart without another inbound event", async () => {
+      const f = await publicationRetryFixture();
+      let unavailable = true;
+      let attempts = 0;
+      f.setSupplementalProviderFetch(async (input, init) => {
+        if (String(input).includes("/issues/comments/") && init?.method === "PATCH") {
+          attempts++;
+          if (unavailable) return new Response("Unavailable", { status: 503, headers: { "retry-after": "120" } });
+        }
+        return f.provider(input, init);
+      });
+      const result = await f.service.execute(f.session, "submit_review", f.assessment, "scheduled-review");
+      expect(result).toMatchObject({ status: "failed", receipt: { retryable: true, attempts: 1 } });
+      const action = await f.action();
+      expect(await f.service.nextPendingAt()).toBe(Date.parse(String(action.result?.retryAt)));
+      expect(await f.service.processPending()).toBe(0);
+      const due = new Date(Date.now() + 1500);
+      await db.update(chatActions).set({ result: { ...action.result, retryAt: due.toISOString() } }).where(eq(chatActions.id, action.id));
+      unavailable = false;
+      const { createDeliveryWorkCoordinator } = await import("../services/delivery-work-coordinator.js");
+      const { registerChatQueueWork } = await import("../services/chat-delivery-work.js");
+      const { DELIVERY_QUEUES } = await import("../services/delivery-work-notifications.js");
+      const restarted = githubChatReviewService(db, f.providerFetch);
+      const errors = vi.fn();
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: errors });
+      try {
+        await registerChatQueueWork(coordinator, { queue: DELIVERY_QUEUES.chatGitHubPublications,
+          run: restarted.processPending, next: restarted.nextPendingAt }, () => true).ready;
+        expect(coordinator.nextWakeAt()).toBe(due.getTime());
+        expect(attempts).toBe(1);
+        await expect.poll(async () => (await f.action()).status, { timeout: 10_000 }).toBe("processed");
+        expect(attempts).toBe(2);
+        expect(errors).not.toHaveBeenCalled();
+        expect(await restarted.nextPendingAt()).toBeNull();
+        expect(f.responseComments.size).toBe(1);
+      } finally {
+        await coordinator.stop();
+      }
+    }, 25_000);
+    it.each([403, 422])("does not resubmit a permanent GitHub publication rejection (HTTP %s)", async status => {
+      const f = await publicationRetryFixture();
+      let attempts = 0;
+      f.setSupplementalProviderFetch(async (input, init) => {
+        if (String(input).includes("/issues/comments/") && init?.method === "PATCH") {
+          attempts++;
+          return new Response("Rejected", { status });
+        }
+        return f.provider(input, init);
+      });
+      const result = await f.service.execute(f.session, "submit_review", f.assessment, "permanent-failure");
+      expect(result).toMatchObject({ status: "failed", receipt: { retryable: false, attempts: 1, providerStatus: status } });
+      await f.service.execute(f.session, "submit_review", f.assessment, "permanent-failure");
+      expect(await f.service.processPending()).toBe(0);
+      expect(await f.service.nextPendingAt()).toBeNull();
+      expect(attempts).toBe(1);
+    });
+    it.each(["revoked", "exhausted"] as const)("stops a queued GitHub publication after %s", async mode => {
+      const f = await publicationRetryFixture();
+      let attempts = 0;
+      f.setSupplementalProviderFetch(async (input, init) => {
+        if (String(input).includes("/issues/comments/") && init?.method === "PATCH") {
+          attempts++;
+          return new Response("Unavailable", { status: 503, headers: { "retry-after": "120" } });
+        }
+        return f.provider(input, init);
+      });
+      await f.service.execute(f.session, "submit_review", f.assessment, "bounded-retry");
+      const action = await f.action();
+      await db.update(chatActions).set({ result: { ...action.result, retryAt: new Date(0).toISOString() } }).where(eq(chatActions.id, action.id));
+      if (mode === "revoked") await db.update(chatIdentityLinks).set({ status: "revoked" }).where(eq(chatIdentityLinks.endpointId, f.endpoint.id));
+      for (let attempt = 1; attempt < (mode === "exhausted" ? 8 : 2); attempt++) {
+        const current = await f.action();
+        await db.update(chatActions).set({ result: { ...current.result, retryAt: new Date(0).toISOString() } }).where(eq(chatActions.id, current.id));
+        await f.service.processPending();
+      }
+      await f.service.processPending();
+      expect((await f.action()).result?.retryable).toBe(false);
+      expect((await f.action()).status).toBe(mode === "revoked" ? "cancelled" : "failed");
+      expect(await f.service.nextPendingAt()).toBeNull();
+      expect(attempts).toBe(mode === "exhausted" ? 8 : 1);
+    });
+    it.each([503, 429])("automatically retries a transient GitHub review publication (HTTP %s)", async providerStatus => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418", true);
+      const head = "b".repeat(40);
+      let summaryAttempts = 0;
+      const checks: Record<string, unknown>[] = [];
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/418")) return Response.json({ number: 418, state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" }, user: { id: 42, login: "octocat", type: "User" }, labels: [] });
+        if (url.includes("/files?")) return Response.json([{ filename: "src/math.ts", status: "modified", patch: "@@ -1 +1 @@\n-old\n+new" }]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [] });
+        if (url.includes("/check-runs") && init?.method) {
+          checks.push(JSON.parse(String(init.body)));
+          return Response.json({ id: 419, html_url: "https://github.com/checks/419" });
+        }
+        if (url.includes("/issues/comments/") && init?.method === "PATCH" && ++summaryAttempts === 1)
+          return new Response("Temporary provider failure", { status: providerStatus, headers: { "retry-after": "1" } });
+        return undefined;
+      });
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => { vi.unstubAllGlobals(); });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      const gateway = createToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: f.run.id });
+      const tool = (await githubBotToolsForSession(db, f.session)).find(tool => tool.upstreamToolName === "submit_review")!;
+      await githubChatReviewService(db, f.providerFetch).execute(f.session, "begin_review", { reviewedCommit: head });
+      const assessment = { reviewedCommit: head, score: 3, complete: true, summary: "Advisory review", rationale: "Reviewed the file",
+        coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] }, findings: [] };
+      const idempotencyKey = randomUUID();
+      const result = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, idempotencyKey });
+      expect(result).toMatchObject({ status: "completed", result: { data: { status: "processed", score: 3, conclusion: "neutral" } } });
+      expect(summaryAttempts).toBe(2);
+      expect(f.responseComments.size).toBe(1);
+      expect(checks).toEqual([expect.objectContaining({ conclusion: "neutral", status: "completed" })]);
+      const replay = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, idempotencyKey });
+      expect(replay).toMatchObject({ result: { data: { status: "processed", score: 3, conclusion: "neutral" } } });
+      expect(summaryAttempts).toBe(2);
+      const [action] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_review_publication")));
+      expect(action).toMatchObject({ status: "processed" });
+      expect((await readChatGitHubReviewsByEndpointId(f.endpoint.id))).toHaveLength(1);
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: { ...assessment, score: 5 }, idempotencyKey }))
+        .rejects.toMatchObject({ status: 409, reasonCode: "github_idempotency_conflict" });
+      await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Revoke review publication", policyType: "block", priority: 0,
+        selectors: { catalogEntryId: tool.catalogEntryId! },
+      });
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, idempotencyKey })).rejects.toThrow();
+      expect(summaryAttempts).toBe(2);
+    }, 25_000);
+    it("lists each GitHub bot tool once when an inline thread shares the task", async () => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418");
+      const { id: _id, ...conversation } = f.conversation;
+      await db.insert(chatConversations).values({
+        ...conversation,
+        externalThreadId: "github:paperclipai/paperclip:418:rc:41901",
+        providerUrl: "https://github.com/paperclipai/paperclip/pull/418#discussion_r41901",
+      });
+      const tools = await githubBotToolsForSession(db, f.session);
+      expect(tools).toHaveLength(7);
+      expect(new Set(tools.map(tool => tool.name)).size).toBe(7);
+      expect(await githubBotToolsForSession(db, { ...f.session, issueId: randomUUID() })).toEqual([]);
+      expect(await readChatConversationsByEndpointId(f.endpoint.id)).toHaveLength(2);
+    });
+    it.each([
+      { label: "returns the confirmed GitHub assessment when publication takes longer than ten seconds", delayMs: 11_000, timeoutMs: undefined },
+      { label: "preserves an explicit shorter GitHub tool deadline and reconciles without duplicate publication", delayMs: 200, timeoutMs: 50 },
+    ])("recovers a durable GitHub publication receipt ($label)", async ({ delayMs, timeoutMs }) => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418", true);
+      const head = "b".repeat(40);
+      const checks: Record<string, unknown>[] = [];
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/418")) return Response.json({ number: 418, state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" }, user: { id: 42, login: "octocat", type: "User" }, labels: [] });
+        if (url.includes("/files?")) return Response.json([{ filename: "src/math.ts", status: "modified", patch: "@@ -1 +1 @@\n-old\n+new" }]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [] });
+        if (url.includes("/check-runs") && init?.method) {
+          checks.push(JSON.parse(String(init.body)));
+          return Response.json({ id: 419, html_url: "https://github.com/checks/419" });
+        }
+        if (url.includes("/issues/comments/") && init?.method === "PATCH") {
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+        return undefined;
+      });
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => { vi.unstubAllGlobals(); });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      const gateway = createToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: f.run.id });
+      const tools = await githubBotToolsForSession(db, f.session);
+      const tool = tools.find(tool => tool.upstreamToolName === "submit_review")!;
+      await githubChatReviewService(db, f.providerFetch).execute(f.session, "begin_review", { reviewedCommit: head });
+      const assessment = { reviewedCommit: head, score: 5, complete: true, summary: "Looks good", rationale: "Reviewed the changed file",
+        coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] }, findings: [] };
+      const result = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, timeoutMs })
+        .then(value => ({ value }), error => ({ error }));
+      await expect.poll(async () => {
+        const [action] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_review_publication")));
+        return action?.status;
+      }, { timeout: 15_000 }).toBe("processed");
+      expect(f.responseComments.size).toBe(1);
+      expect(f.responseWrites.map(write => write.method)).toEqual(["POST", "PATCH"]);
+      expect(checks).toContainEqual(expect.objectContaining({ conclusion: "neutral", status: "completed" }));
+      if (timeoutMs === undefined) {
+        expect(result).toMatchObject({ value: { status: "completed", result: { data: { status: "processed", score: 5, conclusion: "neutral" } } } });
+      } else {
+        expect(result).toMatchObject({ error: { status: 504, reasonCode: "tool_timeout" } });
+      }
+      const writes = f.responseWrites.length;
+      const replay = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment });
+      expect(replay).toMatchObject({ result: { data: { status: "processed", score: 5, conclusion: "neutral" } } });
+      const [invocation] = await db.select().from(toolInvocations).where(eq(toolInvocations.id, replay.invocationId));
+      expect(invocation).toMatchObject({ status: "succeeded", errorCode: null, errorMessage: null });
+      expect(f.responseWrites).toHaveLength(writes);
+    }, 40_000);
     it("does not post a GitHub working comment when the scheduler declines the request", async () => {
       const f = await reviewBotFixture();
       f.wakeup.mockImplementation(async (agentId, opts) => {
@@ -5735,46 +6039,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       };
     }
 
-    it("persists registration before enabling the runtime and preserves unrelated commands", async () => {
-      const f = await registrationFixture();
-      try {
-        await f.configure();
-        const connected = await f.service.get(f.endpoint.id);
-        expect(connected?.capabilities).toMatchObject({
-          slashCommands: true,
-          ephemeralMessages: true,
-        });
-        expect(
-          f.runtime.configurations.get(f.endpoint.id)?.callbacks.onSlashCommand,
-        ).toBeTypeOf("function");
-        expect(f.calls).toEqual(["GET", "POST"]);
-        expect(f.commandRows().map((row) => row.name)).toEqual([
-          "other",
-          "paperclip",
-        ]);
-        const [registration] = await db
-          .select()
-          .from(chatActions)
-          .where(
-            and(
-              eq(chatActions.endpointId, f.endpoint.id),
-              eq(chatActions.kind, "discord_command_registration"),
-            ),
-          );
-        expect(registration?.status).toBe("processed");
-        expect(registration?.payload.registration).toMatchObject({
-          phase: "registered",
-        });
-        expect(JSON.stringify(registration)).not.toContain(
-          f.credentials.botToken,
-        );
-        await f.service.reconcileProviderRuntimes();
-        expect(f.calls).toEqual(["GET", "POST"]);
-      } finally {
-        await retireRegistrationFixture(f.service, f.endpoint.id);
-      }
-    });
-
     it("keeps mention setup usable on registration failure and upgrades automatically when due", async () => {
       const f = await registrationFixture("unavailable");
       try {
@@ -5848,6 +6112,37 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         )!.callbacks;
         expect(originalCallbacks.onMessage).toBeTypeOf("function");
         expect(originalCallbacks.onSlashCommand).toBeTypeOf("function");
+        const connected = await f.service.get(f.endpoint.id);
+        expect(connected?.capabilities).toMatchObject({
+          slashCommands: true,
+          ephemeralMessages: true,
+        });
+        expect(
+          f.runtime.configurations.get(f.endpoint.id)?.callbacks.onSlashCommand,
+        ).toBeTypeOf("function");
+        expect(f.calls).toEqual(["GET", "POST"]);
+        expect(f.commandRows().map((row) => row.name)).toEqual([
+          "other",
+          "paperclip",
+        ]);
+        const [registration] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, f.endpoint.id),
+              eq(chatActions.kind, "discord_command_registration"),
+            ),
+          );
+        expect(registration?.status).toBe("processed");
+        expect(registration?.payload.registration).toMatchObject({
+          phase: "registered",
+        });
+        expect(JSON.stringify(registration)).not.toContain(
+          f.credentials.botToken,
+        );
+        await f.service.reconcileProviderRuntimes();
+        expect(f.calls).toEqual(["GET", "POST"]);
         const shutdown = vi.spyOn(original!, "shutdown");
         const targetRestart = vi.fn(async () => {
           throw new Error(
@@ -7803,10 +8098,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
   it("refreshes Slack tool guidance without restoring disabled catalog policies", async () => {
     const { SLACK_TOOLS } = await import("@paperclipai/shared");
-    const { syncSlackBotTools } = await import("../services/connectors/slack-catalog.js");
+    const { slackBotCatalogIsCurrent, syncSlackBotTools } = await import("../services/connectors/slack-catalog.js");
     const fixture = await seedCompany();
     const { endpoint } = await configuredSlackEndpoint(fixture);
+    expect(await slackBotCatalogIsCurrent(db, endpoint)).toBe(false);
     await db.transaction(tx => syncSlackBotTools(tx, endpoint, "owner-user", true));
+    expect(await slackBotCatalogIsCurrent(db, endpoint)).toBe(true);
     const tool = SLACK_TOOLS.find(tool => tool.name === "slack_post_message")!;
     // Simulate the previous hash contract, which omitted descriptions.
     const oldHash = createHash("sha256").update(JSON.stringify({ name: tool.name, inputSchema: tool.inputSchema, risk: tool.risk, scopes: tool.scopes })).digest("hex");
@@ -7815,7 +8112,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       description: "Old posting guidance", versionHash: oldHash, schemaHash: oldHash,
       status: "removed", reviewedByUserId: "owner-user", reviewedAt,
     }).where(and(eq(toolCatalogEntries.connectionId, endpoint.connectionId), eq(toolCatalogEntries.toolName, tool.name)));
+    expect(await slackBotCatalogIsCurrent(db, endpoint)).toBe(false);
     await db.transaction(tx => syncSlackBotTools(tx, endpoint, "different-operator", true));
+    expect(await slackBotCatalogIsCurrent(db, endpoint)).toBe(true);
     const [updated] = await db.select().from(toolCatalogEntries).where(and(eq(toolCatalogEntries.connectionId, endpoint.connectionId), eq(toolCatalogEntries.toolName, tool.name)));
     expect(updated).toMatchObject({ description: tool.description, status: "removed", reviewedByUserId: "owner-user", reviewedAt });
     expect(updated!.versionHash).not.toBe(oldHash);
@@ -7839,6 +8138,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(assignments.map(item => item.key)).toEqual(["slack"]);
     expect(assignments[0].resources[0]).toMatchObject({ id: endpoint.id, metadata: { requesterId: "UROUTINE" } });
     expect(assignments[0].tools.some(tool => tool.name === "slack_open_dm")).toBe(true);
+    const transactions = vi.spyOn(db, "transaction");
+    try {
+      expect(await resolveConnectorAssignments(db, binding)).toEqual(assignments);
+      expect(transactions).toHaveBeenCalledTimes(2);
+    } finally { transactions.mockRestore(); }
+
     await expect(resolveSlackTaskAuthority(db, binding)).resolves.toMatchObject({ conversation: null, userId: "owner-user", slackUserId: "UROUTINE" });
     const upstream = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const method = String(input).split("/").at(-1);
@@ -27704,6 +28009,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const fixture = await seedCompany();
       const statusCalls: string[] = [];
       const ordinaryFetch = fakeSlackFetch();
+      let releaseReceipt!: () => void;
+      const receiptGate = new Promise<void>((resolve) => { releaseReceipt = resolve; });
       let earlyFinal:
         | ((
             agentId: string,
@@ -27714,6 +28021,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         | undefined;
       const context = await configuredSlackEndpoint(fixture, {
         scheduleDeferredWork: () => undefined,
+        ...(mode === "final_before_add" ? { receiptReactionTransportBarrier: () => receiptGate } : {}),
         fetch: async (input, init) => {
           if (
             String(input) === "https://slack.com/api/agents.sessions.setStatus"
@@ -27786,8 +28094,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
                 eq(chatActions.kind, "receipt_reaction"),
               ),
             ),
-        ).resolves.toHaveLength(0);
+        ).resolves.toHaveLength(1);
         await publishFinal();
+        releaseReceipt();
         return { runId };
       };
       try {
@@ -27907,6 +28216,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ).toHaveLength(1);
         expect(wakeup).toHaveBeenCalledTimes(mode === "newer_followup" ? 2 : 1);
       } finally {
+        releaseReceipt();
         // Retire the synthetic still-running retry's conversation so later
         // globally-scanned milestone fixtures cannot inherit this test's work.
         if (mode === "same_source_retry")
@@ -28117,6 +28427,152 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   });
 
+  it.each(["attachment", "subscription", "wakeup"] as const)("acknowledges a Slack mention while %s is blocked", async (phase) => {
+    const fixture = await seedCompany();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = vi.fn();
+    const blocked = async () => { entered(); await gate; return { accepted: true }; };
+    const { callbacks, endpoint, runtime, service, wakeup } = await configuredSlackEndpoint(fixture, {
+      ...(phase === "wakeup" ? { wakeup: blocked } : {}),
+      ...(phase === "attachment" ? { storage: createStorageService().storage } : {}),
+    });
+    const thread = makeThread({ channelId: "CFAST", id: "slack:CFAST:1740000088.1" });
+    if (phase === "subscription") thread.thread.subscribe = async () => { await blocked(); };
+    const message = makeMessage({ id: "1740000088.1", text: "@maya acknowledge immediately", mentioned: true,
+      ...(phase === "attachment" ? { attachments: [{ type: "file", name: "receipt.txt", mimeType: "text/plain", fetchData: async () => { await blocked(); return Buffer.from("synthetic attachment"); } } as Attachment] } : {}),
+    });
+    const startedAt = performance.now();
+    const inbound = deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread, message, trigger: "mention" });
+    try {
+      await vi.waitFor(() => expect(entered).toHaveBeenCalled(), { timeout: 3_000, interval: 10 });
+      await vi.waitFor(() => expect(runtime.endpoints.get(endpoint.id)!.reactions).toHaveLength(1), { timeout: 1_000, interval: 10 });
+      const [delivery] = await readChatDeliveriesByEndpointId(endpoint.id);
+      await vi.waitFor(async () => {
+        const [receipt] = await readChatActionsByProviderActionId(`receipt_reaction:${delivery.id}`);
+        expect(receipt.status).toBe("processed");
+      }, { timeout: 1_000, interval: 10 });
+      const [receipt] = await readChatActionsByProviderActionId(`receipt_reaction:${delivery.id}`);
+      expect(await readIssuesByCompanyId(fixture.companyId)).toHaveLength(1);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, fixture.companyId))).toHaveLength(0);
+      process.stdout.write(`Slack ${phase} blocked: eyes confirmed in ${(performance.now() - startedAt).toFixed(1)}ms; durable receipt to confirmed action ${receipt.updatedAt.getTime() - delivery.receivedAt.getTime()}ms (synthetic Slack, real PostgreSQL)\n`);
+    } finally {
+      release();
+      await inbound;
+    }
+    await deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread, message, trigger: "mention" });
+    expect(runtime.endpoints.get(endpoint.id)!.reactions).toHaveLength(1);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    await service.shutdown();
+  });
+
+  it.each(["attachment", "subscription"] as const)("preserves an early Slack receipt failure after %s acceptance", async phase => {
+    const fixture = await seedCompany();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = vi.fn();
+    const block = async () => { entered(); await gate; };
+    const { callbacks, endpoint, runtime, service } = await configuredSlackEndpoint(fixture, {
+      ...(phase === "attachment" ? { storage: createStorageService().storage } : {}),
+    });
+    const provider = runtime.endpoints.get(endpoint.id)!;
+    provider.reactionErrors.push(Object.assign(new Error("missing_scope"), { code: "slack_webapi_platform_error", data: { error: "missing_scope" } }));
+    const reaction = vi.spyOn(provider, "applySlackReceiptReaction");
+    const thread = makeThread({ channelId: "CEARLYERROR", id: "slack:CEARLYERROR:1740000091.1" });
+    if (phase === "subscription") thread.thread.subscribe = block;
+    const message = makeMessage({ id: "1740000091.1", text: "@maya preserve the receipt warning", mentioned: true,
+      ...(phase === "attachment" ? { attachments: [{ type: "file", name: "receipt.txt", mimeType: "text/plain", fetchData: async () => { await block(); return Buffer.from("synthetic attachment"); } } as Attachment] } : {}),
+    });
+    const inbound = deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread, message, trigger: "mention" });
+    try {
+      await vi.waitFor(() => expect(entered).toHaveBeenCalled(), { timeout: 3_000, interval: 10 });
+      const [delivery] = await readChatDeliveriesByEndpointId(endpoint.id);
+      await vi.waitFor(async () => {
+        const [receipt] = await readChatActionsByProviderActionId(`receipt_reaction:${delivery.id}`);
+        expect(receipt).toMatchObject({ status: "failed", result: { redactedError: expect.stringContaining("missing_scope") } });
+      }, { timeout: 1_000, interval: 10 });
+      expect((await readChatDeliveriesByEndpointId(endpoint.id))[0].state).toBe("processing");
+      release();
+      await inbound;
+      expect((await readChatDeliveriesByEndpointId(endpoint.id))[0]).toMatchObject({
+        state: "processed", redactedError: expect.stringMatching(/Receipt reaction .*missing_scope/),
+      });
+      expect(reaction).toHaveBeenCalledTimes(1);
+    } finally { release(); await inbound; await service.shutdown(); }
+  });
+
+  it.each(["confirmed", "already reacted"] as const)("keeps an omitted-file warning after an early Slack receipt failure and %s retry", async outcome => {
+    const fixture = await seedCompany();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = vi.fn();
+    const { callbacks, endpoint, runtime, service } = await configuredSlackEndpoint(fixture, { storage: createStorageService().storage });
+    const provider = runtime.endpoints.get(endpoint.id)!;
+    provider.reactionErrors.push(Object.assign(new Error("missing_scope\nsynthetic provider detail"), { code: "slack_webapi_platform_error", data: { error: "missing_scope" } }));
+    if (outcome === "already reacted") provider.reactionErrors.push(Object.assign(new Error("already reacted"), { code: "slack_webapi_platform_error", data: { error: "already_reacted" } }));
+    const reaction = vi.spyOn(provider, "applySlackReceiptReaction");
+    const thread = makeThread({ channelId: "COMITTEDERROR", id: "slack:COMITTEDERROR:1740000092.1" });
+    const inbound = deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread, trigger: "mention",
+      message: makeMessage({ id: "1740000092.1", text: "@maya retain both warnings", mentioned: true,
+        attachments: [{ type: "file", name: "omitted.txt", mimeType: "text/plain", fetchData: async () => { entered(); await gate; throw new Error("controlled file download failure"); } } as Attachment],
+      }),
+    });
+    try {
+      await vi.waitFor(() => expect(entered).toHaveBeenCalled(), { timeout: 3_000, interval: 10 });
+      const [delivery] = await readChatDeliveriesByEndpointId(endpoint.id);
+      await vi.waitFor(async () => {
+        const [receipt] = await readChatActionsByProviderActionId(`receipt_reaction:${delivery.id}`);
+        expect(receipt.status).toBe("failed");
+      }, { timeout: 1_000, interval: 10 });
+      release();
+      await inbound;
+      const before = (await readChatDeliveriesByEndpointId(endpoint.id))[0];
+      expect(before.redactedError).toContain("Receipt reaction");
+      expect(before.redactedError).toContain("1 external attachment was omitted");
+      expect(reaction).toHaveBeenCalledTimes(1);
+      const [receipt] = await readChatActionsByProviderActionId(`receipt_reaction:${delivery.id}`);
+      await db.update(chatActions).set({ result: { ...receipt.result, retryable: true, retryAt: new Date(0).toISOString() } }).where(eq(chatActions.id, receipt.id));
+      await service.processPendingReceiptReactions(1, receipt.id);
+      const after = (await readChatDeliveriesByEndpointId(endpoint.id))[0];
+      expect(after.redactedError).toContain("1 external attachment was omitted");
+      expect(after.redactedError).not.toContain("Receipt reaction");
+      expect(after.redactedError).not.toContain("synthetic provider detail");
+      expect(reaction).toHaveBeenCalledTimes(2);
+      expect((await readChatActionsById(receipt.id))[0].status).toBe("processed");
+    } finally { release(); await inbound; await service.shutdown(); }
+  });
+
+  it("acknowledges a signed URL mention through the real Slack SDK without waiting for an unfurl", async () => {
+    const fixture = await seedCompany();
+    const { endpoint, runtime, service, wakeup } = await configuredSlackEndpoint(fixture);
+    const pinned = createChatSdkEndpointRuntime({ ...runtime.configurations.get(endpoint.id)!, logger: "silent" });
+    const threadId = "slack:CFASTSDK:1740000090.1";
+    const adapter = pinned.thread(threadId).adapter as unknown as {
+      _client: { auth: { test: (...args: unknown[]) => Promise<unknown> }; users: { info: (...args: unknown[]) => Promise<unknown> } };
+    };
+    adapter._client.auth.test = vi.fn(async () => ({ ok: true, user_id: "UBOT", user: "maya", team_id: "T-PAPERCLIP" }));
+    adapter._client.users.info = vi.fn(async () => ({ ok: true, user: { id: "USENDER", profile: { display_name: "Test sender" } } }));
+    const startedAt = performance.now();
+    try {
+      const response = await pinned.handleWebhook(signedSlackWebhookRequest({
+        url: `https://paperclip.example/api/chat-webhooks/${endpoint.publicId}/slack`, contentType: "application/json",
+        body: JSON.stringify({ type: "event_callback", event_id: "EvFASTSDK", team_id: "T-PAPERCLIP",
+          event: { type: "app_mention", channel: "CFASTSDK", user: "USENDER", ts: "1740000090.1", text: "<@UBOT> review <https://example.com/review|this link>" },
+        }),
+      }));
+      expect(response.status).toBe(200);
+      await vi.waitFor(() => expect(runtime.endpoints.get(endpoint.id)!.reactions).toEqual([
+        { threadId, messageId: "1740000090.1", emoji: "eyes" },
+      ]), { timeout: 1_000, interval: 10 });
+      expect(wakeup).toHaveBeenCalledTimes(1);
+      expect(adapter._client.users.info).toHaveBeenCalled();
+      process.stdout.write(`Signed URL mention through real Slack SDK: eyes confirmed in ${(performance.now() - startedAt).toFixed(1)}ms (real PostgreSQL, simulated provider APIs)\n`);
+    } finally {
+      await pinned.shutdown();
+      await service.shutdown();
+    }
+  });
+
   it("settles a retried Slack receipt reaction when the provider reports already_reacted", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, runtime, service } =
@@ -28199,6 +28655,37 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).resolves.toEqual([{ redactedError: null }]);
     expect(endpointRuntime.reactionErrors).toEqual([]);
     await service.shutdown();
+  });
+
+  it.each([false, true])("clears an older multi-line Slack receipt diagnostic on terminal removal with attachment warning %s", async hasAttachmentWarning => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service } = await configuredSlackEndpoint(fixture);
+    try {
+      const thread = makeThread({ channelId: "COLDWARNING", id: "slack:COLDWARNING:1740000093.1" });
+      await deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread, trigger: "mention",
+        message: makeMessage({ id: "1740000093.1", text: "@maya clear an older receipt diagnostic", mentioned: true }),
+      });
+      const [delivery] = await readChatDeliveriesByEndpointId(endpoint.id);
+      const [receipt] = await readChatActionsByProviderActionId(`receipt_reaction:${delivery.id}`);
+      const diagnostic = "Receipt reaction failed after 1 attempt (endpoint_attention): missing_scope\nsynthetic provider detail";
+      const attachmentWarning = "1 external attachment was omitted";
+      await db.update(chatActions).set({ status: "failed", result: { attempts: 1, retryable: false, redactedError: diagnostic } }).where(eq(chatActions.id, receipt.id));
+      await db.update(chatDeliveries).set({ redactedError: diagnostic + (hasAttachmentWarning ? `\n${attachmentWarning}` : "") }).where(eq(chatDeliveries.id, delivery.id));
+      const [conversation] = await service.listConversations(endpoint.id);
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: fixture.companyId, agentId: fixture.assignedAgentId, status: "succeeded",
+        contextSnapshot: await chatWakeContext({ endpointId: endpoint.id, issueId: conversation.issueId, provider: "slack", providerMessageId: "1740000093.1" }),
+      });
+      const removalIds = await db.transaction(tx => stageReceiptReactionRemovals(tx as unknown as Db, {
+        endpoint, binding: { companyId: fixture.companyId, endpointId: endpoint.id, conversationId: conversation.id, issueId: conversation.issueId }, runId,
+        runtimeContext: { generation: Number(receipt.payload.runtimeGeneration), credentialFingerprint: String(receipt.payload.credentialFingerprint) },
+      }));
+      expect(removalIds).toHaveLength(1);
+      await service.processPendingReceiptReactions(1, removalIds[0]);
+      expect(runtime.endpoints.get(endpoint.id)!.removedReactions).toEqual([{ threadId: thread.thread.id, messageId: "1740000093.1", emoji: "eyes" }]);
+      expect((await readChatActionsById(removalIds[0]))[0].status).toBe("processed");
+      expect((await readChatDeliveriesByEndpointId(endpoint.id))[0].redactedError).toBe(hasAttachmentWarning ? attachmentWarning : null);
+    } finally { await service.shutdown(); }
   });
 
   it("canonicalizes prefixed Chat SDK channel ids onto provider inventory resources", async () => {
@@ -69214,6 +69701,72 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(JSON.stringify(runtime.edits)).not.toMatch(
         /PRIVATE|token=|scheduler/,
       );
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it.each(["not-a-uuid", "", "uppercase"])("skips a pre-run FIFO candidate with a noncanonical coalesced owner id (%s)", async (ownerId) => {
+    const context = await deferredChatQueueFixture();
+    try {
+      const [receipt] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, context.action.id));
+      await db
+        .update(agentWakeupRequests)
+        .set({
+          payload: {
+            ...receipt.payload,
+            coalescedIntoWakeupRequestId: ownerId === "uppercase" ? context.action.id.toUpperCase() : ownerId,
+          },
+        })
+        .where(eq(agentWakeupRequests.id, context.action.id));
+      await expect(
+        context.service.enqueueInboundWakeupPublications(),
+      ).resolves.toBe(0);
+      await expect(
+        db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.endpointId, context.endpoint.id)),
+      ).resolves.toEqual([]);
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it("keeps the pre-run FIFO sweep running when a valid owner's action has comment ids that are not uuids", async () => {
+    const context = await deferredChatQueueFixture();
+    try {
+      // Publish the queued notice first. The removed-comment and queued-notice
+      // checks then have real rows to compare the malformed ids against.
+      await context.service.processPendingPublications();
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.endpointId, context.endpoint.id)),
+      ).resolves.toEqual([{ state: "published" }]);
+      await db
+        .update(chatActions)
+        .set({
+          payload: {
+            ...context.action.payload,
+            issueId: "not-a-uuid",
+            commentId: "not-a-uuid",
+          },
+        })
+        .where(eq(chatActions.id, context.action.id));
+      await expect(
+        context.service.enqueueInboundWakeupPublications(),
+      ).resolves.toBe(0);
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.endpointId, context.endpoint.id)),
+      ).resolves.toEqual([{ state: "published" }]);
     } finally {
       await context.service.shutdown();
     }

@@ -87,6 +87,17 @@ remaining operations before qualifying the whole capability.
 Gaps: Normal agent replies work through server delivery. Explicit endpoint publication
 APIs are board management paths.
 
+GitHub publication recovery (2026-10-14): assigned-agent `submit_review`, `comment`,
+and `update_comment` calls reuse their run-, task-, endpoint-, and argument-bound
+publication on an exact retry. Fresh gateway policy and provider authority remain
+required. The durable worker resumes transient failures after restart and stops
+at its retry cap, revoked authority, or a superseded head. A pending receipt is
+not task completion. Source:
+[publication service](../../server/src/services/chat-github-reviews.ts) and
+[gateway](../../server/src/services/tool-gateway.ts). Verification uses
+PostgreSQL-backed provider fixtures; this entry does not claim live provider
+qualification for the new retry path.
+
 Speko browser sessions use `POST /api/companies/{companyId}/voice-sessions`,
 with GET inspection/notification and POST `/{sessionId}/end` operations below
 that collection. These routes require board identity; ordinary agent credentials
@@ -103,6 +114,20 @@ apply. Top-level DM replies retain their linear conversation destination. Source
 [admission](../../server/src/services/chat-channels.ts) and
 [queued run policy](../../server/src/services/durable-chat-wakeup.ts). Live Slack
 verification of this exemption remains separate from provider-fixture coverage.
+
+Slack eyes acknowledge the authorized task/comment commit before attachment
+preparation or scheduler acceptance. This server-owned receipt grants no agent
+authority. Generation/credential fencing, durable retries and exact-source final
+cleanup still apply. PostgreSQL fixtures block attachments, subscription and
+wakeup independently to verify that none gates the reaction; live Slack latency
+remains a separate check. See [receipt worker](../../server/src/services/chat-channels/receipt-reactions.ts).
+
+Controller-owned receipt reactions accept the SDK's empty thread timestamp for
+linear DMs. Channel IDs and source message timestamps remain validated. This
+does not add an agent tool or change sender, task, or credential authorization.
+The pinned SDK transport regression is covered in
+[receipt tests](../../server/src/services/chat-slack-receipts.test.ts); live
+acknowledgement speed needs a separate provider test.
 
 New conversations resolve typed project/workspace defaults from their endpoint
 and destination under the task-creation transaction. Defaults do not authorize

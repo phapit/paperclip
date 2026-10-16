@@ -23,6 +23,8 @@ import * as managedRepositoryCheckout from "../managed-repository-checkout.js";
 import { isolatedRemoteSourcePath } from "../isolated-remote-workspace-source.js";
 import { cleanupExecutionWorkspaceArtifacts } from "../workspace-runtime.js";
 import { issueService } from "../issues.js";
+import { trace } from "@opentelemetry/api";
+import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
 
 const execFile = promisify(execFileCallback);
 const support = await getEmbeddedPostgresTestSupport();
@@ -120,6 +122,47 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(input.controllerLease.assertOwned).toHaveBeenCalledTimes(2);
   });
 
+  it("records workspace steps around real persistence before environment acquisition", async () => {
+    const { input, source, issue, envOrchestrator } = await fixture();
+    const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+    vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
+    const exporter = new InMemorySpanExporter();
+    const provider = new TracerProvider({ spanProcessors: [new SimpleSpanProcessor({ exporter })] });
+    expect(trace.setGlobalTracerProvider(provider)).toBe(true);
+    const acquire = envOrchestrator.acquireForRun;
+    vi.spyOn(envOrchestrator, "acquireForRun").mockImplementation(async args => {
+      const names = exporter.getFinishedSpans().map(span => span.name);
+      expect(names).toContain("heartbeat.prepare.workspace_record_create");
+      expect(names).toContain("heartbeat.prepare.workspace_binding");
+      expect((await readIssue(issue.id)).executionWorkspaceId).toBe(args.persistedExecutionWorkspace?.id);
+      return acquire(args);
+    });
+    try {
+      const result = await prepareHeartbeatWorkspace(db, input);
+      expect(result.executionWorkspace.cwd).toBe(source);
+      await provider.forceFlush();
+      const spans = exporter.getFinishedSpans();
+      expect(spans.map(span => span.name)).toEqual(expect.arrayContaining([
+        "heartbeat.prepare.workspace_source_resolution",
+        "heartbeat.prepare.workspace_provision_policy",
+        "heartbeat.prepare.workspace_base_validation",
+        "heartbeat.prepare.workspace_provision",
+        "heartbeat.prepare.workspace_operation_binding",
+        "heartbeat.prepare.workspace_config_recording",
+        "heartbeat.prepare.workspace_repository_admission",
+        "heartbeat.prepare.workspace_project_repositories",
+      ]));
+      for (const span of spans) {
+        expect(Object.keys(span.attributes)).toEqual(["paperclip.task.run.run_id"]);
+        expect(JSON.stringify(span.attributes)).not.toContain(source);
+      }
+    } finally {
+      vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint);
+      trace.disable();
+      await provider.shutdown();
+    }
+  });
+
   it.each(["create", "failed-save", "shared-retry-after-failed-save", "literal-branch", "legacy-explicit-source", "inherited-source", "legacy-untyped-source", "changed-source-intent", "context-source"] as const)("preserves restricted source isolation during %s", async scenario => {
     const { input, source, issue: originalIssue } = await fixture(true);
     await db.update(companies).set({ issueCounter: 1 }).where(eq(companies.id, originalIssue.companyId));
@@ -184,7 +227,8 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
       await execFile("git", ["-C", source, "checkout", "main"]);
       if (scenario === "literal-branch") input.config.mergedConfig = { workspaceStrategy: { type: "git_worktree", baseRef: "main", branchTemplate: "feature/literal-pin" } };
       const acquire = vi.spyOn(input.services.envOrchestrator, "acquireForRun");
-      await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Task workspace access is no longer available");
+      await expect(prepareHeartbeatWorkspace(db, input)).rejects.toMatchObject({ code: "configuration_incomplete",
+        resultJson: { configurationIncomplete: { reason: "workspace_source_restricted", issueId: issue.id } } });
       expect(clone).not.toHaveBeenCalled();
       expect(acquire).not.toHaveBeenCalled();
       expect((await readIssue(issue.id)).executionWorkspaceId).toBeNull();
@@ -253,6 +297,32 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(reopened).toMatchObject({ ok: true });
     expect(await readFile(join(workspace.cwd!, "README.md"), "utf8")).toBe("source content\n");
     expect(await readFile(join(privateCwd, "confidential.txt"), "utf8")).toBe("Private source must not be copied");
+  });
+
+  it("keeps a reused shared-checkout workspace denied with an owner action after a restricted worktree appears", async () => {
+    const { input, source, issue } = await fixture(true);
+    const first = await prepareHeartbeatWorkspace(db, input);
+    const workspace = first.persistedExecutionWorkspace!;
+    expect(first.executionWorkspace.baseCwd).toBe(source);
+    await writeFile(join(workspace.cwd!, "unpublished-work.txt"), "Keep this task's local work\n");
+    const [privateIssue] = await db.insert(issues).values({ companyId: issue.companyId, title: "Private work",
+      visibility: "private", projectId: issue.projectId }).returning();
+    const privateCwd = join(source, "private-work");
+    await execFile("git", ["-C", source, "worktree", "add", "-b", "restricted-task", privateCwd, "main"]);
+    const [privateWorkspace] = await db.insert(executionWorkspaces).values({ companyId: issue.companyId,
+      name: "Private workspace", projectId: issue.projectId, sourceIssueId: privateIssue.id, cwd: privateCwd, mode: "isolated_workspace",
+      strategyType: "git_worktree", providerType: "git_worktree", providerRef: privateCwd, branchName: "restricted-task", status: "idle" }).returning();
+    await db.update(issues).set({ executionWorkspaceId: privateWorkspace.id }).where(eq(issues.id, privateIssue.id));
+    await reuse(input, workspace);
+    const clone = vi.spyOn(managedRepositoryCheckout, "materializeManagedProjectWorkspace");
+    const acquire = vi.spyOn(input.services.envOrchestrator, "acquireForRun");
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toMatchObject({ code: "configuration_incomplete",
+      resultJson: { configurationIncomplete: { reason: "workspace_source_restricted", issueId: issue.id } } });
+    expect(clone).not.toHaveBeenCalled();
+    expect(acquire).not.toHaveBeenCalled();
+    expect((await readIssue(issue.id)).executionWorkspaceId).toBe(workspace.id);
+    expect(await readFile(join(workspace.cwd!, "unpublished-work.txt"), "utf8")).toBe("Keep this task's local work\n");
+    await expect(access(isolatedRemoteSourcePath(issue.companyId, issue.id))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it.each(["sandbox", "ssh", "local", null] as const)("uses the selected %s placement for controller provisioning", async driver => {
