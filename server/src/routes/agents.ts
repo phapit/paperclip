@@ -543,6 +543,7 @@ export function agentRoutes(
     droid_local: "instructionsFilePath",
     gemini_local: "instructionsFilePath",
     kimi_local: "instructionsFilePath",
+    antigravity_local: "instructionsFilePath",
     opencode_local: "instructionsFilePath",
     cursor: "instructionsFilePath",
     pi_local: "instructionsFilePath",

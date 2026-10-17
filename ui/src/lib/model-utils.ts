@@ -31,6 +31,7 @@ const CURATED_MODEL_ORDER_ADAPTERS: ReadonlySet<string> = new Set([
   "gemini_local",
   "grok_local",
   "kimi_local",
+  "antigravity_local",
   "openclaw_gateway",
   "opencode_local",
   "pi_local",
