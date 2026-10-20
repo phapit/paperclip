@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { createPiLaunchSpec } from "./pi-acp-runtime.js";
 import { createCopilotToolEvidence } from "./copilot-tool-evidence.js";
@@ -315,6 +316,69 @@ describe("ACPX runtime host", () => {
     expect(openRuntime).not.toHaveBeenCalled();
   });
 
+  it("leaves an active Claude owner's effort settings unchanged when a second opener loses the lifetime lease", async () => {
+    const fixture = await hostFixture();
+    let settingsPath = "";
+    const openRuntime = vi.fn(async () => runtimePort({ getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }) }));
+    const dependencies = fixture.dependencies({ openRuntime });
+    const prepare = dependencies.prepareSandbox!;
+    dependencies.prepareSandbox = async input => {
+      const sandbox = await prepare(input);
+      settingsPath = join(sandbox.agentHomeDirectory, "settings.json");
+      return sandbox;
+    };
+    const options = { ...fixture.options, agent: "claude" as const, model: "claude-sonnet-5", permissionMode: "approve-all" as const };
+    const host = await AcpxRuntimeHost.open(options, dependencies);
+    try {
+      const ownedSettings = `${JSON.stringify({ ...JSON.parse(await readFile(settingsPath, "utf8")), effortLevel: "high", activeOwnerMarker: true })}\n`;
+      await writeFile(settingsPath, ownedSettings, { mode: 0o600 });
+      await expect(AcpxRuntimeHost.open(options, dependencies)).rejects.toThrow("already has an active lease");
+      expect(await readFile(settingsPath, "utf8")).toBe(ownedSettings);
+      expect(openRuntime).toHaveBeenCalledTimes(1);
+    } finally { await host.close({ reason: "ownership regression complete" }); }
+    const nextOwner = await waitForAcpxOperation(() => AcpxRuntimeHost.open(options, dependencies));
+    try {
+      expect(JSON.parse(await readFile(settingsPath, "utf8"))).not.toHaveProperty("activeOwnerMarker");
+      expect(openRuntime).toHaveBeenCalledTimes(2);
+    } finally { await nextOwner.close({ reason: "next owner complete" }); }
+  });
+
+  it.each([false, true])("cancels Claude startup promptly while retaining its settings write and lease (late failure: %s)", async failWrite => {
+    const fixture = await hostFixture();
+    const controller = new AbortController();
+    let announceWrite!: () => void;
+    let finishWrite!: () => void;
+    const writeStarted = new Promise<void>(resolve => { announceWrite = resolve; });
+    const writePending = new Promise<void>(resolve => { finishWrite = resolve; });
+    const openRuntime = vi.fn(async () => runtimePort({ getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }) }));
+    const dependencies = fixture.dependencies({ openRuntime });
+    const prepare = dependencies.prepareSandbox!;
+    dependencies.prepareSandbox = async input => {
+      const sandbox = await prepare(input);
+      const initialize = sandbox.initializeOwnedConfiguration;
+      return { ...sandbox, initializeOwnedConfiguration: async () => {
+        announceWrite();
+        await writePending;
+        if (failWrite) throw new Error("settings write failed after cancellation");
+        await initialize?.();
+      } };
+    };
+    const options = { ...fixture.options, agent: "claude" as const, model: "claude-sonnet-5", permissionMode: "approve-all" as const };
+    const opening = AcpxRuntimeHost.open({ ...options, signal: controller.signal }, dependencies);
+    const rejected = expect(opening).rejects.toThrow("settings admission cancelled");
+    try {
+      await writeStarted;
+      controller.abort(new Error("settings admission cancelled"));
+      await runAcpxOperationAttempt(() => rejected, Date.now() + 1_000);
+      expect(openRuntime).not.toHaveBeenCalled();
+      await expect(AcpxRuntimeHost.open(options, fixture.dependencies({ openRuntime }))).rejects.toThrow("already has an active lease");
+    } finally { finishWrite(); }
+    await rejected;
+    expect(openRuntime).not.toHaveBeenCalled();
+    const nextOwner = await waitForAcpxOperation(() => AcpxRuntimeHost.open(options, fixture.dependencies({ openRuntime })));
+    await nextOwner.close({ reason: "cancelled initializer ownership released" });
+  });
+
   it("registers the assigned connection gateway alongside the Claude task bridge", async () => {
     const fixture = await hostFixture();
     let servers: AcpxRuntimePortOpenOptions["mcpServers"] = [];
@@ -336,6 +400,28 @@ describe("ACPX runtime host", () => {
       expect(servers[1]).toEqual({ name: "paperclip-assigned", url: "http://127.0.0.1:3211/mcp/gateway",
         bearerToken: "fixture-gateway-token-".repeat(3), runnerOwned: true });
     } finally { await host.close({ reason: "gateway test complete" }); }
+  });
+
+  it.each([false, true])("keeps stdio registration session-local and omits it for readOnly=%s", async readOnly => {
+    const fixture = await hostFixture();
+    const command = join(fixture.root, "desktop-server");
+    await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o555 });
+    const binding = { name: "desktop", command: await realpath(command), args: ["mcp"], env: { HOME: fixture.root },
+      sha256: `sha256:${createHash("sha256").update(await readFile(command)).digest("hex")}`,
+      serialResource: join(fixture.root, "cua.sock") };
+    let servers: AcpxRuntimePortOpenOptions["mcpServers"] = [];
+    const host = await AcpxRuntimeHost.open({ ...fixture.options, agent: "claude", model: "claude-sonnet-5",
+      permissionMode: "approve-reads", providerPolicy: { readOnly },
+      environment: { ...fixture.options.environment, PAPERCLIP_NATIVE_MCP_STDIO: JSON.stringify([binding]), PAPERCLIP_NATIVE_MCP_PROXY: "/verified/runnerd" },
+    }, fixture.dependencies({ openRuntime: async options => {
+      servers = options.mcpServers;
+      return runtimePort({ getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }) });
+    } }));
+    try {
+      const desktop = servers.find(server => server.name === "desktop");
+      if (readOnly) expect(desktop).toBeUndefined();
+      else expect(desktop).toMatchObject({ name: "desktop", command: "/verified/runnerd", runnerOwned: false, env: {} });
+    } finally { await host.close({ reason: "stdio policy verified" }); }
   });
 
   it.each([
@@ -818,6 +904,31 @@ describe("ACPX runtime host", () => {
     expect(assertWorkspaceHeld).toHaveBeenCalledTimes(2);
     expect(openRuntime).not.toHaveBeenCalled();
     expect(fixture.commandClose).toHaveBeenCalledOnce();
+  });
+
+  it.each(["claude", "codex", "copilot"] as const)("preloads essential task tools only for Claude through the host (%s)", async agent => {
+    const fixture = await hostFixture();
+    const model = agent === "claude" ? "claude-opus-5-5" : "gpt-5.6-sol";
+    let bridge: Extract<AcpxRuntimePortOpenOptions["mcpServers"][number], { url: string }> | undefined;
+    const environment = agent === "claude" ? { ANTHROPIC_API_KEY: "fixture-not-a-real-credential" }
+      : agent === "copilot" ? { COPILOT_GITHUB_TOKEN: "fixture-not-a-real-credential" }
+        : { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" };
+    const host = await AcpxRuntimeHost.open({
+      ...fixture.options, agent, model, permissionMode: "deny-all", environment,
+      semanticTools: { tools: [{ name: "set_task_title", inputSchema: { type: "object", properties: {} } }], handler: async () => ({}) },
+    }, fixture.dependencies({ openRuntime: async options => {
+      bridge = options.mcpServers.find((server): server is NonNullable<typeof bridge> => "url" in server && server.runnerOwned);
+      return runtimePort({ getStatus: async () => ({ models: { currentModelId: model, availableModelIds: [model] } }) });
+    } }));
+    try {
+      const response = await fetch(bridge!.url, {
+        method: "POST", headers: { Authorization: `Bearer ${bridge!.bearerToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      const listed = await response.json() as { result: { tools: Array<{ name: string; _meta?: Record<string, unknown> }> } };
+      expect(listed.result.tools.filter(tool => tool._meta?.["anthropic/alwaysLoad"] === true).map(({ name }) => name))
+        .toEqual(agent === "claude" ? ["set_task_title", "paperclip_finish", "paperclip_block"] : []);
+    } finally { await host.close({ reason: "tool preload verified" }); }
   });
 
   it("forwards semantic receipt capture through the real runtime host and authenticated bridge", async () => {

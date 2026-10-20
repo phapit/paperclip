@@ -1510,6 +1510,42 @@ describe("sandbox callback bridge", () => {
     await expect(readFile(remotePath, "utf8")).rejects.toThrow();
   });
 
+  it.each([
+    "/api/companies/co-1/heartbeat-runs",
+    "/api/companies/co-1/live-runs",
+    "/api/heartbeat-runs/run-1",
+    "/api/heartbeat-runs/run-1/events",
+    "/api/heartbeat-runs/run-1/log",
+    "/api/heartbeat-runs/run-1/workspace-operations",
+    "/api/heartbeat-runs/run-1/issues",
+    "/api/issues/issue-1/runs",
+    "/api/issues/issue-1/recovery-actions",
+  ])("admits only GET for diagnostic path %s on both transports", (requestPath) => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method: "GET", path: requestPath }, routes)).toBeNull();
+      for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+        expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method, path: requestPath }, routes))
+          .toBe(`Route not allowed: ${method} ${requestPath}`);
+      }
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method: "GET", path: `${requestPath}/extra` }, routes))
+        .toBe(`Route not allowed: GET ${requestPath}/extra`);
+    }
+  });
+
+  it.each([
+    { method: "POST", path: "/api/heartbeat-runs/run-1/cancel" },
+    { method: "POST", path: "/api/heartbeat-runs/run-1/retry" },
+    { method: "POST", path: "/api/heartbeat-runs/run-1/watchdog-decisions" },
+    { method: "POST", path: "/api/issues/issue-1/recovery-actions/resolve" },
+    { method: "POST", path: "/api/issues/issue-1/recovery-actions/retry-workspace-export" },
+    { method: "GET", path: "/api/heartbeat-runs/run-1/provider-trace" },
+    { method: "GET", path: "/api/companies/co-1/provider-traces" },
+    { method: "GET", path: "/api/companies/co-1/execution-workspaces" },
+  ])("keeps execution control and unrelated reads denied: $method $path", (request) => {
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request))
+      .toBe(`Route not allowed: ${request.method} ${request.path}`);
+  });
+
   it("permits the documented heartbeat surface and denies unrelated routes", () => {
     const allowed: Array<{ method: string; path: string }> = [
       { method: "POST", path: "/api/companies/co-1/agent-commentary" },
@@ -3256,8 +3292,10 @@ describe("sandbox callback bridge", () => {
   async function startHttp2GatewayForTest(options: {
     bridgeToken: string;
     maxBodyBytes?: number;
+    holdProbeOpen?: () => boolean;
+    deferStderrUntilExit?: boolean;
     forwardRequest: (request: Http2BridgeForwardRequest) => Promise<Http2BridgeForwardResult>;
-  }): Promise<{ baseUrl: string; stop: () => Promise<void> }> {
+  }, attempt = 0): Promise<{ baseUrl: string; stop: () => Promise<void> }> {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-http2-test-"));
     cleanupDirs.push(rootDir);
     const entrypoint = path.join(rootDir, "paperclip-bridge-server.mjs");
@@ -3272,7 +3310,12 @@ describe("sandbox callback bridge", () => {
           reject(new Error("Could not reserve a loopback port for the test."));
           return;
         }
-        probe.close(() => resolve(address.port));
+        if (options.holdProbeOpen?.()) {
+          cleanupFns.push(() => new Promise<void>((resolve) => probe.close(() => resolve())));
+          resolve(address.port);
+        } else {
+          probe.close(() => resolve(address.port));
+        }
       });
     });
 
@@ -3293,6 +3336,16 @@ describe("sandbox callback bridge", () => {
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8");
     });
+
+    if (options.deferStderrUntilExit) {
+      const resume = child.stderr.resume.bind(child.stderr);
+      child.stderr.pause();
+      child.stderr.resume = () => child.stderr;
+      child.once("exit", () => setImmediate(() => {
+        child.stderr.resume = resume;
+        resume();
+      }));
+    }
 
     const dataListeners: Array<(chunk: Uint8Array) => void> = [];
     const pending: Buffer[] = [];
@@ -3331,7 +3384,7 @@ describe("sandbox callback bridge", () => {
       }
       deliver(chunk);
     });
-    child.once("exit", (code) => {
+    child.once("close", (code) => {
       clearTimeout(readyTimer);
       if (!sawReadyLine) {
         rejectReady(new Error("The http2 gateway exited early with code " + String(code) + ". stderr: " + stderr));
@@ -3356,7 +3409,16 @@ describe("sandbox callback bridge", () => {
       },
     };
 
-    await readyPromise;
+    try {
+      await readyPromise;
+    } catch (error) {
+      child.kill();
+      if (attempt < 2 && child.exitCode === 1
+        && stderr.includes("http2 gateway could not bind port") && stderr.includes("EADDRINUSE")) {
+        return startHttp2GatewayForTest(options, attempt + 1);
+      }
+      throw error;
+    }
 
     const handle = createHttp2BridgeServer({
       bridgeToken: options.bridgeToken,
@@ -3792,15 +3854,38 @@ describe("sandbox callback bridge", () => {
     expect(seenRequests[0]?.body).toBe(requestBodyText);
   });
 
-  it("accepts the bridge token in X-API-Key on the HTTP/2 path and strips the header", async () => {
+  it("does not retry unrelated HTTP/2 fixture startup failures", async () => {
+    let attempts = 0;
+    await expect(startHttp2GatewayForTest({
+      bridgeToken: "",
+      holdProbeOpen: () => { attempts++; return false; },
+      forwardRequest: async () => { throw new Error("Unexpected request to an unstarted gateway"); },
+    })).rejects.toThrow("PAPERCLIP_BRIDGE_TOKEN");
+    expect(attempts).toBe(1);
+  });
+
+  it("limits HTTP/2 fixture retries when every assigned port is occupied", async () => {
+    let attempts = 0;
+    await expect(startHttp2GatewayForTest({
+      bridgeToken: createSandboxCallbackBridgeToken(),
+      holdProbeOpen: () => { attempts++; return true; },
+      forwardRequest: async () => { throw new Error("Unexpected request to an unstarted gateway"); },
+    })).rejects.toThrow("EADDRINUSE");
+    expect(attempts).toBe(3);
+  }, 15000);
+
+  it.each([[false, false], [true, false], [true, true]])("accepts the bridge token in X-API-Key on the HTTP/2 path and strips the header (collision=%s, late stderr=%s)", async (portCollision, lateStderr) => {
     // Both generated gateways share one token reader, so the HTTP/2 transport
     // must accept "X-API-Key" exactly as the file-mode transport does. The
     // header allowlist must still strip the credential before the gateway
     // forwards the request to the host.
     const bridgeToken = createSandboxCallbackBridgeToken();
     const seenHeaders: Array<Record<string, string>> = [];
+    let attempts = 0;
     const gateway = await startHttp2GatewayForTest({
       bridgeToken,
+      holdProbeOpen: () => { attempts++; return portCollision && attempts === 1; },
+      deferStderrUntilExit: lateStderr,
       forwardRequest: async (request) => {
         seenHeaders.push(request.headers);
         return {
@@ -3810,6 +3895,9 @@ describe("sandbox callback bridge", () => {
         };
       },
     });
+
+    expect(attempts).toBeGreaterThanOrEqual(portCollision ? 2 : 1);
+    expect(attempts).toBeLessThanOrEqual(3);
 
     const response = await fetch(`${gateway.baseUrl}/api/agents/me`, {
       headers: {

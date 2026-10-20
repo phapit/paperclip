@@ -1,3 +1,4 @@
+import { resolveClaudeEffort } from "./claude-effort.js";
 import { piProviderConfiguration } from "./pi-provider-config.js";
 import { withAcpxTurnCancellation } from "./turn-cancellation.js";
 import { resolveAcpxProviderMode } from "./provider-mode.js";
@@ -9,6 +10,7 @@ import { assertAcpxProfileEnvironment, assertAcpxProfileWorkspace, classifyAcpxP
 import { createAcpxRuntimeSkillLease } from "./runtime-skill-lease.js";
 import { stageManagedGrokCredential } from "./grok-credentials.js";
 import { claudeNativeSkillPrompt } from "./native-skill-prompt.js";
+import { prepareStdioMcpBindings } from "../stdio-mcp.js";
 import { nativeMcpLaunchBinding } from "../native-mcp.js";
 
 import type {
@@ -84,6 +86,7 @@ const ACPX_ADMISSION_CLEANUP_RESCHEDULE_MS = 1_000;
 export interface AcpxRuntimePortIdentity {
   mode?: string;
   piThinkingLevel?: PiThinkingLevel;
+  claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   acpxRecordId: string;
   backendSessionId: string;
   agentSessionId: string;
@@ -164,6 +167,7 @@ export interface AcpxRuntimePortOpenOptions {
   permissionMode: NativeAcpxPermissionMode;
   mode?: string;
   piThinkingLevel?: PiThinkingLevel;
+  claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   permissionPolicy: ReturnType<typeof acpxRuntimePermissionPolicy>;
   launchEnvironment: Readonly<NodeJS.ProcessEnv>;
   /** Kernel credential-home quorum inherited by the provider sentinel. */
@@ -184,14 +188,13 @@ export interface AcpxRuntimePortOpenOptions {
   retainFailedAdmissionCleanup(cleanup: Promise<void>): void;
 }
 
-export interface AcpxMcpServerBinding {
-  name: string;
-  url: string;
-  bearerToken: string;
-  runnerOwned: boolean;
-}
+export type AcpxMcpServerBinding = {
+  name: string; url: string; bearerToken: string; runnerOwned: boolean;
+} | {
+  name: string; command: string; args: string[]; env: Record<string, string>; runnerOwned: false;
+};
 
-export type AcpxSemanticToolSession = Omit<RunnerToolBridgeOptions, "secret">;
+export type AcpxSemanticToolSession = Omit<RunnerToolBridgeOptions, "secret" | "preloadClaudeTaskTools">;
 
 export interface AcpxRetainedCleanupFailure {
   resource:
@@ -239,6 +242,7 @@ export interface OpenAcpxRuntimeHostOptions {
   permissionMode: NativeAcpxPermissionMode;
   mode?: string;
   piThinkingLevel?: PiThinkingLevel;
+  claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   systemInstructions?: string;
   runtimeContext?: NativeRuntimeContextSnapshot | null;
   environment?: NodeJS.ProcessEnv;
@@ -361,6 +365,7 @@ export class AcpxRuntimeHost {
           permissionMode: options.permissionMode,
           mode: resolveAcpxProviderMode(options.agent, options.mode),
           piThinkingLevel: resolvePiThinkingLevel(options.agent, options.piThinkingLevel),
+          claudeEffort: resolveClaudeEffort(options.agent, options.claudeEffort),
           ...(preconfigured ? { homeBinding: preconfiguredHomeEnvironment(options.environment) } : {}),
           ...(["cursor", "copilot", "pi"].includes(options.agent) && options.providerPolicy !== undefined
             ? { providerPolicy: options.providerPolicy } : {}),
@@ -489,6 +494,21 @@ export class AcpxRuntimeHost {
             dependencies.reportRetainedCleanupFailure(failure),
         });
       }
+      options.signal?.throwIfAborted();
+      const configurationLifetime = credential;
+      await runAbortableAdmissionStage(
+        options.signal,
+        async () => { await sandbox.initializeOwnedConfiguration?.(); },
+        cleanup => {
+          pendingRuntimeOwnsCredential = true;
+          const retained = cleanup.then(() => cleanupAbortedRuntimeAdmission(
+            null, configurationLifetime, "ACPX owned configuration cancelled",
+          ));
+          retainRuntimeHostCleanup(retained);
+          dependencies.retainAdmissionCleanup?.(retained);
+        },
+      );
+      options.signal?.throwIfAborted();
       assertAcpxProfileEnvironment(options.agent, sandbox.launchEnvironment);
       let launchEnvironment = sandbox.launchEnvironment;
       // This copy is registered by the authenticated controller for its company,
@@ -562,7 +582,10 @@ export class AcpxRuntimeHost {
       toolBridge = options.semanticTools
         ? await acquireAbortableAdmissionResource({
             signal: options.signal,
-            acquire: () => startRunnerToolBridge(options.semanticTools!),
+            acquire: () => startRunnerToolBridge({
+              ...options.semanticTools!,
+              preloadClaudeTaskTools: options.agent === "claude",
+            }),
             resource: "tool_bridge",
             releaseLate: (lateToolBridge) => lateToolBridge.close(),
             reportFailure: (failure) =>
@@ -593,6 +616,7 @@ export class AcpxRuntimeHost {
             permissionMode: binding.permissionMode,
             mode: binding.mode,
             piThinkingLevel: binding.piThinkingLevel,
+            claudeEffort: binding.claudeEffort,
             permissionPolicy: acpxRuntimePermissionPolicy(
               binding.permissionMode,
             ),
@@ -606,6 +630,7 @@ export class AcpxRuntimeHost {
               : { assertWorkspaceHeld: () => { options.assertWorkspaceHeld?.(); agentFiles?.assertHeld(); } }),
             ...(options.signal === undefined ? {} : { signal: options.signal }),
             mcpServers: [
+              ...(options.providerPolicy?.readOnly ? [] : prepareStdioMcpBindings(options.environment ?? {}, sandbox.root)),
               ...(toolBridge ? [{ name: preconfigured ? `paperclip_runner_${binding.profileSessionKey.slice(-16)}` : "paperclip", url: toolBridge.url,
                 bearerToken: toolBridge.secret, runnerOwned: true }] : []),
               // This is Paperclip's authenticated gateway, not a direct upstream
@@ -656,6 +681,7 @@ export class AcpxRuntimeHost {
       if (runtimeIdentity.piThinkingLevel !== binding.piThinkingLevel) {
         throw new Error("ACPX runtime Pi thinking level conflicts with session binding");
       }
+      if (runtimeIdentity.claudeEffort !== binding.claudeEffort) throw new Error("ACPX runtime Claude effort conflicts with session binding");
       const observedIdentity: AcpxExpectedSessionIdentity = {
         kind: "acpx",
         normalizedSessionId: binding.normalizedSessionId,

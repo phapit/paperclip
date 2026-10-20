@@ -5,6 +5,16 @@ Run-log events write to the `heartbeat_run_events` table
 Paperclip Telemetry events, and they are not OpenTelemetry exports. A run-log
 event needs no operator endpoint.
 
+## Ordinary event persistence
+
+Events without a native source identity or retry-exhaustion receipt use one
+atomic PostgreSQL statement. The statement checks the stored run's company and
+agent, allocates its next sequence, and inserts the event. An insertion failure
+also rolls back the sequence allocation. The returned row uses the existing
+column decoders, including the lossless payload codec. Callers still wait for
+the durable write before they publish or acknowledge the event. Native-source
+replay and retry-exhaustion deduplication retain their existing transaction path.
+
 ## Provider-pack preparation timing
 
 The existing `run.performance.span` event also records `provider_pack.select`,
@@ -546,3 +556,10 @@ retries cleanup. This event preserves the run outcome and does not claim a file
 save; `instruction_save` remains authoritative for collection. The event contains
 no raw exception, host path, file contents, or lock-owner metadata. Failure to
 write the warning must not replace the provider outcome or stop lease release.
+
+## Agent observability availability
+
+`agent_observability.unavailable` is one warning for a preparation snapshot that
+cannot apply company export settings. Its payload contains only a closed reason
+and the settings revision. It carries no endpoint, credential, secret reference
+or resolver error. Recording the diagnostic never contacts a destination.
