@@ -17,13 +17,13 @@ Do not mark an item done from a timer removal or a green check alone.
 | 03 | Run and task recovery | Orphan runs and active leases; shutdown workspace settlement; scheduled retries; queued runs; stranded assignments; resolved dependencies; task watchdogs; silent-run monitoring; stale locks | Pending |
 | 04 | Decision retention and notifications | Retention deadlines and notification delivery are separate reasons | Approval retention [#17497](https://github.com/paperclipai/paperclip/pull/17497) and archive delivery [#17475](https://github.com/paperclipai/paperclip/pull/17475) merged; other source retention pending |
 | 05 | Decision expiry and interrupted effects | Expiry, effect recovery, continuation recovery | Continuations [#17478](https://github.com/paperclipai/paperclip/pull/17478) merged; expiry [#17479](https://github.com/paperclipai/paperclip/pull/17479) merged; effects [#17482](https://github.com/paperclipai/paperclip/pull/17482) merged; targets [#17486](https://github.com/paperclipai/paperclip/pull/17486) merged |
-| 06 | Tool connection health | Configuration/use activation and defined proactive health deadlines | Pending |
+| 06 | Tool connection health | Configuration/use activation and defined proactive health deadlines | #17554 repaired at `8c1d293d1a`; fresh CI/review in progress |
 | 07 | Secret proposals, tool reviews, gateway tokens | Separate expiry/scrub/recovery owners | Slices 02–07 merged: [secret proposals](https://github.com/paperclipai/paperclip/pull/17446), [credentials](https://github.com/paperclipai/paperclip/pull/17450), [review expiry](https://github.com/paperclipai/paperclip/pull/17453), [approved recovery](https://github.com/paperclipai/paperclip/pull/17454), [interrupted claims](https://github.com/paperclipai/paperclip/pull/17458), [projection](https://github.com/paperclipai/paperclip/pull/17468) |
 | 08 | GitHub connection events and continuity | Event discovery/replay and credential continuity separately | Pending |
 | 09 | Merged-PR confirmations | Candidate writes, webhook activation where supported, outstanding-candidate fallback | Pending |
 | 10 | External-object refresh | Configuration changes, refresh deadlines, source events | Pending |
 | 11 | Status-card evaluation | Settings/card mutations and evaluation deadlines | Pending |
-| 12 | Plugin scheduled jobs | Registration/update/removal and actual job deadlines | Pending |
+| 12 | Plugin scheduled jobs | Registration/update/removal and actual job deadlines | #17518 published; see latest-head gate records below |
 | 13 | Routine, agent-timer and issue-monitor scheduling | Remove periodic wake backstops after complete producer coverage; routine execution-status reconciliation separately | Pending |
 | 14 | Skill-version retention and native-harness backup expiration | Separate retention owners and existing retention guarantees | Pending |
 | 15 | Automatic database backups | Shared scheduling, actual backup deadlines, existing checkpoint contract | Pending |
@@ -1314,6 +1314,53 @@ recorded, not counted as passes. Total selected coverage is 770 cases. The serve
 build passes. The inventory SQL uses the existing company/enabled index with
 40,000 retained rows (13 buffers, 0.022 ms). Full workspace and remote gates remain.
 
+## Health publication and next chat boundary
+
+Tool health is [#17554](https://github.com/paperclipai/paperclip/pull/17554), head
+`2ca12f806399cfcef1a474453301534f4b96c1ef`, stacked on #17518. Local workspace
+checks/build and 770 selected tests pass. CI run 40165710347 is confirmed live;
+Greptile and security review are running. This is not final acceptance.
+
+The next runtime-discovery audit found command-registration recovery hidden
+inside `reconcileDiscordRuntime`. That is a separate durable reason and must get
+its own PR before removing the runtime discovery backstop. Slice 19 audits that
+owner in [Discord command registration](2026-10-25-discord-command-registration-sleep-audit.md).
+Runtime discovery, active lease renewal, voice, Teams, and every original pending
+inventory item remain in scope. No merges are authorized.
+
+
+## Slice 19 foundation and health review status
+
+Discord registration now has a normalized saved-deadline reader, scoped store
+notifications, paged eligibility discovery, and a shared-coordinator worker.
+Thirty-six real-DB protocol/lifecycle cases and server typechecking pass. See
+[the audit and remaining integration](2026-10-25-discord-command-registration-sleep-audit.md).
+It is not wired into startup, the old runtime call is not removed, and no PR is
+published for this slice yet. Complete producer wiring and consumer verification
+before removing the backstop.
+
+Tool-health #17554 at `da4089960619d3da2112a4eed3cc7a3d97dbebf8` has passing
+Actions checks and fresh Greptile 5/5 after the failed-probe warning repair.
+Paperclip Review remains queued, so final acceptance is still open. Its PR body
+now records 771 selected local tests and the outstanding gate. No PR was merged.
+
+
+## Slice 19 integration
+
+Discord registration now has complete producer wiring and a startup worker;
+recurring runtime reconciliation no longer invokes its command protocol. The
+[contract](../idle-discord-command-registration.md) records retained verification
+policy, scoped producer coverage, supported writers and separate runtime duties.
+Local selected coverage is 639 unique passing tests, with workspace types/build
+passing before the final fair-batch addition. Final server typechecking and build
+also pass. Remote publication/gates remain open.
+
+The latest health Paperclip Review completed neutral, with a 4/5 assessment and
+follow-ups for cross-company backlog fairness and direct service-producer tests.
+These remain owning-PR work despite green Actions and Greptile 5/5. The same
+fairness defect was reproduced and repaired in the Discord worker. Shared helper
+commit `e77979d4fc` is ready to carry into #17554. No PR is newly accepted or merged.
+
 
 ## Discord publication and health fairness repair
 
@@ -1365,6 +1412,56 @@ requests preserving queued scopes after malformed hints and broader producer
 coverage. Its initial head has Greptile 5/5 but these findings remain open.
 
 
+Discord review repairs are in progress. Both new worker regressions failed before
+repair: the 300-command backlog did not drain promptly, and an unknown hint lost
+later scopes. Bounded backlog continuations and full reconstruction after malformed
+scope parsing repair them; all 62 combined command/health/batching cases pass.
+Real credential rotation also passes. The company-deletion producer test exposed
+an existing dependency-order failure: agents are deleted before chat endpoints
+whose assigned-agent foreign key is RESTRICT. Configuring the fixture lifecycle
+removed the initial missing-worker failure but reproduced this actual SQL failure.
+Keep the failing producer test; repair the deletion dependency in its own stack
+PR before publishing the Discord follow-up. Current local changes are not final
+acceptance. The original full inventory and remaining CI gates are still open.
+
+
+Company deletion prerequisite is [#17561](https://github.com/paperclipai/paperclip/pull/17561),
+head `4d721402d2`, based on #17554. Both new regressions failed first; all six
+cleanup-removal tests and server types/build pass after the fix. The chat owner
+removes company endpoints before agent purge in the same transaction. Other
+companies and global namespace tombstones remain unchanged; a later failure rolls
+back the deletion. Existing voice-history restrictions remain in force. Remote
+CI/review are required; this is a focused correctness dependency, not a migration
+of another inventory duty.
+
+The prerequisite is merged into the local Discord branch at `2802c361f3`. The
+company command signal precedes endpoint deletion. All seven real automatic
+registration integration cases now pass, including rotation and deletion, plus
+62 combined worker/batching cases and final server types/build. The earlier
+missing lifecycle fixture, actual dependency-order failure, and merge-conflict
+invocation are recorded in the Discord document. Update #17557's base to #17561
+and publish the review repairs for fresh CI/review. Cumulative selected Discord
+coverage is 643 cases. Health #17554 at `f8ad26f0ff` has no failures and one pending
+check at the last observation; do not mark it fully accepted yet.
+
+Next new owner remains chat runtime discovery/ownership, separate from command
+registration, voice, and active transport renewals. The full original inventory,
+#17490 E2E cancellation failure, final stack/master reconciliation, and all PR
+acceptance gates remain required. No stack merge is authorized.
+
+
+Prerequisite #17561 review found that retained chat conversations/publications
+also restrict issue deletion. Expanded real-history fixtures reproduced that
+failure, and cleanup now runs immediately after locking the company. All six
+cleanup cases pass, including restoration of chat history on later failure. The
+review thread is resolved at parent head `e7c29e4840`; fresh review/CI still apply.
+Discord inherits that parent at `33954efd2e` and registers its company intent
+before the earlier cleanup. Seven producer integrations and all six cleanup cases
+pass on the merged branch. The 1,413 deselected broad chat cases are not passes.
+Health `f8ad26f0ff` now has fresh Greptile 5/5 and no failed checks; Paperclip Review
+was still queued at the last inspection. The full goal remains active.
+
+
 Health security repair: five real connection API updates in a 205-connection
 company reproduced 1,025 inventory rows. Individual writers now signal their
 connection IDs; application writers signal their application IDs. Genuine broad
@@ -1375,6 +1472,17 @@ the repair to #17554, propagate through company-deletion #17561 into Discord
 #17557, and require fresh remote gates. No PR in this stack is merged. The next
 new owner remains chat runtime discovery; the full remaining ledger is unchanged.
 
+
+Published health security repair is 9ef6e4f4c8; fresh security and Greptile checks
+pass, with Actions still running at inspection. Company cleanup inherits it at
+e8febb30eb; six cleanup tests pass. Discord inherits it at fe1c886a3d, preserving
+both command and scoped health intents. Its previous-head CI exposed a flaky
+quiet-window/spying fixture and review reproduced failure-path backlog throttling.
+The repaired coordinator honors actual future deadlines without zero-delay error
+loops or changing domain backoff. All 152 selected command/coordinator/health,
+producer/Slack, delivery/standby/startup cases and server types/build pass. Publish
+for fresh CI/review. The full inventory, #17490 CI failure, and stack/master
+reconciliation remain open; no merge authority is implied.
 ## Acceptance follow-up after the plugin parent merged (October 27)
 
 Eighteen preceding sleep PRs are merged through plugin scheduling #17518 at
@@ -1389,3 +1497,11 @@ baselines, real concurrency proof, and fresh-database verification. Older stack
 status and test counts above are historical. The original remaining inventory
 is still in scope beyond the 65 published numbered slices; native backups and
 the remaining aggregate duties have not been migrated by this follow-up.
+
+
+## Discord registration landing compatibility, October 27
+
+Company deletion has landed. The Discord command slice retains only its original
+26-file delta against the landed parent and current master at `f8563d2507`. All
+141 targeted cases, server typecheck and build pass. The [owning audit](2026-10-25-discord-command-registration-sleep-audit.md#acceptance-after-the-company-deletion-parent-landed-october-27)
+records exact scope, fixture setup and remaining remote gates.
