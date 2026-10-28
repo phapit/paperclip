@@ -1,3 +1,5 @@
+import { notifyApprovalWork } from "./approval-work-notifications.js";
+import { notifyDecisionTargetIssueRemoval } from "./decision-targets.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { verifyAppWebhook } from "./app-webhook.js";
 import crypto from "node:crypto";
@@ -18,7 +20,6 @@ import {
   folders,
   goals,
   heartbeatRuns,
-  issueInboxArchives,
   issues,
   pluginManagedResources,
   plugins,
@@ -1695,38 +1696,6 @@ export function routineService(
     return value;
   }
 
-  async function touchIssueForUserInbox(
-    executor: Db,
-    input: {
-      companyId: string;
-      issueId: string;
-      userId: string;
-      touchedAt: Date;
-    },
-  ) {
-    await executor.insert(activityLog).values({
-      companyId: input.companyId,
-      actorType: "user",
-      actorId: input.userId,
-      action: "issue.inbox_touched",
-      entityType: "issue",
-      entityId: input.issueId,
-      responsibleUserId: input.userId,
-      details: { source: "manual_routine_run" },
-      createdAt: input.touchedAt,
-    });
-
-    await executor
-      .delete(issueInboxArchives)
-      .where(
-        and(
-          eq(issueInboxArchives.companyId, input.companyId),
-          eq(issueInboxArchives.issueId, input.issueId),
-          eq(issueInboxArchives.userId, input.userId),
-        ),
-      );
-  }
-
   async function dispatchRoutineRun(input: {
     routine: typeof routines.$inferSelect;
     trigger: typeof routineTriggers.$inferSelect | null;
@@ -1896,14 +1865,6 @@ export function routineService(
         });
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
-              issueId: activeIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
-            });
-          }
           const updated = await finalizeRun(createdRun.id, {
             status,
             linkedIssueId: activeIssue.id,
@@ -1963,14 +1924,6 @@ export function routineService(
           });
           if (!existingIssue) throw error;
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
-              issueId: existingIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
-            });
-          }
           const updated = await finalizeRun(createdRun.id, {
             status,
             linkedIssueId: existingIssue.id,
@@ -2013,6 +1966,8 @@ export function routineService(
         return updated ?? createdRun;
       } catch (error) {
         if (createdIssue) {
+          await notifyApprovalWork(txDb, createdIssue.companyId);
+          await notifyDecisionTargetIssueRemoval(txDb, createdIssue.id);
           await txDb.delete(issues).where(eq(issues.id, createdIssue.id));
         }
         const failureReason = error instanceof Error ? error.message : String(error);
